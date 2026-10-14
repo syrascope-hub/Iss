@@ -1,0 +1,42 @@
+name: Build APK from ZIP
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unzip project
+        run: |
+          unzip -q iss_sstv_tracker.zip -d work
+          echo "APP_DIR=work/iss_sstv_tracker" >> $GITHUB_ENV
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Generate Android project
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter create --platforms=android --project-name iss_sstv_tracker .
+      - name: Patch manifest and minSdk
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/><uses-permission android:name="android.permission.RECORD_AUDIO"/><application#' $M
+          sed -i 's#<application#<application android:usesCleartextTraffic="true"#' $M
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' android/app/build.gradle.kts || true
+          sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/' android/app/build.gradle || true
+      - name: Get packages
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter pub get
+      - name: Build APK
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter build apk --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iss-sstv-tracker-apk
+          path: work/iss_sstv_tracker/build/app/outputs/flutter-apk/app-release.apk
