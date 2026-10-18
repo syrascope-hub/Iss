@@ -1,18 +1,132 @@
-name: iss_sstv_tracker
-description: ISS tracker with automatic Doppler tuning for WebSDR
-publish_to: none
-version: 0.1.0
-environment:
-  sdk: '>=3.3.0 <4.0.0'
-dependencies:
-  flutter:
-    sdk: flutter
-  http: ^1.2.0
-  flutter_map: ^7.0.2
-  latlong2: ^0.9.1
-  satellite_dart: ^1.0.2
-  record: ^5.1.2
-  path_provider: ^2.1.3
-  shared_preferences: ^2.2.3
-flutter:
-  uses-material-design: true
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unzip project if uploaded as zip
+        run: find . -name '*.zip' -not -path './.git/*' -execdir unzip -o -q {} \;
+
+      - name: Locate project
+        id: loc
+        run: |
+          P=$(find . -name pubspec.yaml -not -path './.git/*' | head -1)
+          if [ -z "$P" ]; then
+            echo "pubspec.yaml not found. Repo contents:"
+            find . -not -path './.git/*' -type f | head -50
+            exit 1
+          fi
+          echo "dir=$(dirname "$P")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.35.7"
+          channel: stable
+          cache: true
+
+      - name: Generate android platform
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: |
+          cp pubspec.yaml /tmp/pubspec.yaml
+          cp -r lib /tmp/lib
+          flutter create . --platforms=android --org com.astro --project-name iss_sstv_tracker
+          cp /tmp/pubspec.yaml pubspec.yaml
+          rm -rf lib && cp -r /tmp/lib lib
+          rm -rf test
+
+      - name: Apply app icon
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: cp -r tool/res/. android/app/src/main/res/
+
+      - name: Patch android (permissions, desugaring, minSdk)
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib, re, sys
+
+          root = pathlib.Path("android")
+          man = root / "app/src/main/AndroidManifest.xml"
+          s = man.read_text(encoding="utf-8")
+          s = re.sub(r'android:label="[^"]*"', 'android:label="ISS SSTV"', s, count=1)
+
+          perms = [
+              "android.permission.INTERNET",
+              "android.permission.POST_NOTIFICATIONS",
+              "android.permission.RECEIVE_BOOT_COMPLETED",
+              "android.permission.WAKE_LOCK",
+              "android.permission.FOREGROUND_SERVICE",
+              "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+          ]
+          add = "".join(
+              '    <uses-permission android:name="%s"/>\n' % p
+              for p in perms if p not in s
+          )
+          if add:
+              s = s.replace("<application", add + "    <application", 1)
+          if "usesCleartextTraffic" not in s:
+              s = s.replace("<application", '<application\n        android:usesCleartextTraffic="true"', 1)
+          if "ScheduledNotificationReceiver" not in s:
+              recv = """
+              <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />
+              <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver">
+                  <intent-filter>
+                      <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                      <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+                      <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                      <action android:name="com.htc.intent.action.QUICKBOOT_POWERON"/>
+                  </intent-filter>
+              </receiver>
+          """
+              s = s.replace("</application>", recv + "    </application>", 1)
+          if "ForegroundService" not in s:
+              svc = """
+              <service android:name="com.dexterous.flutterlocalnotifications.ForegroundService" android:exported="false" android:stopWithTask="false" android:foregroundServiceType="mediaPlayback" />
+          """
+              s = s.replace("</application>", svc + "    </application>", 1)
+          man.write_text(s, encoding="utf-8")
+
+          kts = root / "app/build.gradle.kts"
+          groovy = root / "app/build.gradle"
+          if kts.exists():
+              g = kts.read_text(encoding="utf-8")
+              if "isCoreLibraryDesugaringEnabled" not in g:
+                  g = re.sub(r"(compileOptions\s*\{)", r"\1\n        isCoreLibraryDesugaringEnabled = true", g, count=1)
+                  g += '\ndependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")\n}\n'
+              g = re.sub(r"minSdk\s*=\s*[^\n]+", "minSdk = 23", g)
+              kts.write_text(g, encoding="utf-8")
+          elif groovy.exists():
+              g = groovy.read_text(encoding="utf-8")
+              if "coreLibraryDesugaringEnabled" not in g:
+                  g = re.sub(r"(compileOptions\s*\{)", r"\1\n        coreLibraryDesugaringEnabled true", g, count=1)
+                  g += "\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'\n}\n"
+              g = re.sub(r"minSdk(Version)?\s*=?\s*flutter\.minSdkVersion", "minSdkVersion 23", g)
+              g = re.sub(r"minSdk(Version)?\s*=?\s*\d+", "minSdkVersion 23", g)
+              groovy.write_text(g, encoding="utf-8")
+          else:
+              sys.exit("build.gradle not found")
+          print("android patched")
+          PYEOF
+
+      - name: Build
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: |
+          flutter pub get
+          flutter analyze --no-fatal-infos --no-fatal-warnings
+          flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iss-sstv-tracker-apk
+          path: ${{ steps.loc.outputs.dir }}/build/app/outputs/flutter-apk/app-release.apk
